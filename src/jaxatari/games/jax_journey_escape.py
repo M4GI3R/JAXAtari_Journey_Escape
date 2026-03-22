@@ -240,6 +240,8 @@ class JourneyEscapeConstants(AutoDerivedConstants):
     diagonal_random_switch_cooldown_range: int = struct.field(pytree_node=False, default=40)
     # When True, random direction switches are per-obstacle instead of per-group (obstacles can split)
     diagonal_switch_per_obstacle: bool = struct.field(pytree_node=False, default=False)
+    
+    is_twin_mode: bool = struct.field(pytree_node=False, default=False)
 
 @struct.dataclass
 class JourneyEscapeState:
@@ -265,6 +267,12 @@ class JourneyEscapeState:
     countdown: chex.Array
 
     bg_frames: chex.Array
+
+    twin_y: chex.Array
+    twin_x: chex.Array
+    twin_walking_direction: chex.Array
+    twin_hit_cooldown: chex.Array
+    twin_invincibility_timer: chex.Array
 
 @struct.dataclass
 class EntityPosition:
@@ -321,6 +329,11 @@ class JaxJourneyEscape(
             hit_cooldown=jnp.array(0, dtype=jnp.int32),
             countdown=jnp.array(self.consts.start_countdown, dtype=jnp.int32),
             bg_frames=jnp.array(0, dtype=jnp.int32),
+            twin_y=jnp.array(player_y, dtype=jnp.int32),
+            twin_x=jnp.array(player_x - 20, dtype=jnp.int32),
+            twin_walking_direction=jnp.array(0, dtype=jnp.int32),
+            twin_hit_cooldown=jnp.array(0, dtype=jnp.int32),
+            twin_invincibility_timer=jnp.array(0, dtype=jnp.int32),
         )
 
         return self._get_observation(state), state
@@ -382,6 +395,9 @@ class JaxJourneyEscape(
         # "Proposed" movement from input only (used for collision detection)
         pre_y = jnp.clip(state.player_y + dy_int, player_min_y, player_max_y).astype(jnp.int32)
         pre_x = jnp.clip(state.player_x + dx_int, player_min_x, player_max_x).astype(jnp.int32)
+
+        twin_pre_y = jnp.clip(state.twin_y + dy_int, player_min_y, player_max_y).astype(jnp.int32)
+        twin_pre_x = jnp.clip(state.twin_x + dx_int, player_min_x, player_max_x).astype(jnp.int32)
 
         #---OBSTACLES---
 
@@ -629,50 +645,43 @@ class JaxJourneyEscape(
             # It is a ghost (invisible/pass-through) if we are past the ON duration
             is_ghost = is_photographer & (cycle_pos >= self.consts.photographer_on_duration)
 
-            # AABB Collision
+            # AABB Collision Main Player
             p_x, p_y = pre_x, pre_y
             p_w, p_h = self.consts.player_width, self.consts.player_height
 
-            overlap_x = (p_x < b_x + b_w) & (p_x + p_w > b_x)
-            overlap_y = (p_y < b_y + b_h) & (p_y + p_h > b_y)
+            overlap_x1 = (p_x < b_x + b_w) & (p_x + p_w > b_x)
+            overlap_y1 = (p_y < b_y + b_h) & (p_y + p_h > b_y)
+            hit1 = is_active & jnp.logical_not(is_ghost) & overlap_x1 & overlap_y1
 
-            hit = is_active & jnp.logical_not(is_ghost) & overlap_x & overlap_y
+            # AABB Collision Twin Player
+            p2_x, p2_y = twin_pre_x, twin_pre_y
+            overlap_x2 = (p2_x < b_x + b_w) & (p2_x + p_w > b_x)
+            overlap_y2 = (p2_y < b_y + b_h) & (p2_y + p_h > b_y)
+            hit2 = is_active & jnp.logical_not(is_ghost) & overlap_x2 & overlap_y2
 
             # Relative X Position (Center to Center)
-            # Positive = Player is to the Right of Obstacle
-            # Negative = Player is to the Left of Obstacle
-            p_center_x = p_x + (p_w // 2)
-            b_center_x = b_x + (b_w // 2)
-            rel_x = (p_center_x - b_center_x).astype(jnp.int32)
+            p_center_x1 = p_x + (p_w // 2)
+            rel_x1 = (p_center_x1 - (b_x + (b_w // 2))).astype(jnp.int32)
 
-            return hit, b_type, rel_x
+            p_center_x2 = p2_x + (p_w // 2)
+            rel_x2 = (p_center_x2 - (b_x + (b_w // 2))).astype(jnp.int32)
 
-        # Vectorize over all obstacles
-        # collision_mask: bool[MAX_OBS]
-        # type_mask: int32[MAX_OBS]
-        # relative_x: int32[MAX_OBS]
-        collision_mask, type_mask, relative_x = jax.vmap(get_collision_data)(boxes)
+            return hit1, hit2, b_type, rel_x1, rel_x2
+
+        collision_mask1, collision_mask2, type_mask, relative_x1, relative_x2 = jax.vmap(get_collision_data)(boxes)
 
         # --- Consumables, Physics & Scoring ---
 
         # Distinguish Collision Types
         is_solid_type = self.consts.IS_SOLID[type_mask]
-        solid_collisions = collision_mask & is_solid_type
-        consumable_collisions = collision_mask & jnp.logical_not(is_solid_type)
+        
+        solid_collisions1 = collision_mask1 & is_solid_type
+        consumable_collisions1 = collision_mask1 & jnp.logical_not(is_solid_type)
+
+        solid_collisions2 = (collision_mask2 & is_solid_type) & self.consts.is_twin_mode
+        consumable_collisions2 = (collision_mask2 & jnp.logical_not(is_solid_type)) & self.consts.is_twin_mode
 
         def check_anchor(box):
-            """
-            Checks if the player is *currently* physically inside a solid obstacle.
-
-            Standard `solid_collisions` checks the PROPOSED position (`pre_y`).
-            If the player is at the bottom edge of an obstacle and presses DOWN,
-            `pre_y` might project a position just *outside* the hitbox.
-            Without this check, the game would think the path is clear, release the
-            'sticky' drag, and allow the player to strafe away (not possible in ALE).
-
-            This function ensures that if the player's CURRENT coordinates overlap,
-            the drag physics remain active.
-            """
             b_x, b_y, b_w, b_h, b_type, _b_dx, _b_mp, _b_cd = box
             is_active = b_h > 0
             is_photographer = (b_type == 4) | (b_type == 8)
@@ -682,189 +691,150 @@ class JaxJourneyEscape(
             is_ghost = is_photographer & (cycle_pos >= self.consts.photographer_on_duration)
             is_solid = self.consts.IS_SOLID[b_type]
 
-            overlap_x = (state.player_x < b_x + b_w) & (state.player_x + self.consts.player_width > b_x)
-            overlap_y = (state.player_y < b_y + b_h) & (state.player_y + self.consts.player_height > b_y)
-            return is_active & is_solid & jnp.logical_not(is_ghost) & overlap_x & overlap_y
+            overlap_x1 = (state.player_x < b_x + b_w) & (state.player_x + self.consts.player_width > b_x)
+            overlap_y1 = (state.player_y < b_y + b_h) & (state.player_y + self.consts.player_height > b_y)
+            hit1 = is_active & is_solid & jnp.logical_not(is_ghost) & overlap_x1 & overlap_y1
 
-        anchor_collisions = jax.vmap(check_anchor)(boxes)
-        is_stuck = jnp.any(solid_collisions | anchor_collisions)
+            overlap_x2 = (state.twin_x < b_x + b_w) & (state.twin_x + self.consts.player_width > b_x)
+            overlap_y2 = (state.twin_y < b_y + b_h) & (state.twin_y + self.consts.player_height > b_y)
+            hit2 = is_active & is_solid & jnp.logical_not(is_ghost) & overlap_x2 & overlap_y2
+
+            return hit1, hit2
+
+        anchor_collisions1, anchor_collisions2 = jax.vmap(check_anchor)(boxes)
+        anchor_collisions2 = anchor_collisions2 & self.consts.is_twin_mode
+
+        is_stuck1 = jnp.any(solid_collisions1 | anchor_collisions1)
+        is_stuck2 = jnp.any(solid_collisions2 | anchor_collisions2)
 
         # Handle Consumables (whole row disapears)
-
-        # Identify the Y-coordinates of consumed items
-        hit_y_values = jnp.where(consumable_collisions, boxes[:, 1], -999)
-
-        # Does box[i].y match ANY of the hit_y_values?
-        # We compare every box Y against every Hit Y.
-        # Matrix: (MAX_OBS, MAX_OBS) -> [i, j] is True if Box i has same Y as Hit Box j
+        hit_y_values = jnp.where(consumable_collisions1 | consumable_collisions2, boxes[:, 1], -999)
         all_y = boxes[:, 1]
         match_matrix = (all_y[:, None] == hit_y_values[None, :])
-
-        # If a box matches ANY hit Y, it is part of the group.
-        # We also ensure we only cull active items that are essentially "linked".
         is_part_of_group = jnp.any(match_matrix, axis=1)
 
-        # Set height to 0 if it is part of a consumed group.
         current_heights = boxes[:, 3]
         new_heights_after_eat = jnp.where(is_part_of_group, 0, current_heights)
         boxes = boxes.at[:, 3].set(new_heights_after_eat)
 
-        # Invincibility Logic (Variable Duration)
+        # Invincibility Logic
+        hit_manager1 = jnp.any(consumable_collisions1 & (type_mask == 9))
+        hit_roadie1 = jnp.any(consumable_collisions1 & ((type_mask == 1) | (type_mask == 5)))
+        added_duration1 = jnp.where(hit_manager1, self.consts.INV_DURATION_MANAGER,
+                            jnp.where(hit_roadie1, self.consts.INV_DURATION_ROADIE, 0))
+        new_inv_timer1 = jnp.maximum(jnp.maximum(state.invincibility_timer - 1, 0), added_duration1)
+        is_invincible1 = new_inv_timer1 > 0
 
-        # Identify Specific Power-up Hits
-        hit_manager = jnp.any(consumable_collisions & (type_mask == 9))
-        hit_roadie = jnp.any(consumable_collisions & ((type_mask == 1) | (type_mask == 5)))
-
-        # Determine Duration to Set
-        added_duration = jnp.where(
-            hit_manager,
-            self.consts.INV_DURATION_MANAGER,
-            jnp.where(hit_roadie, self.consts.INV_DURATION_ROADIE, 0)
-        )
-
-        # Update Invincible Timer
-        new_inv_timer = jnp.maximum(
-            jnp.maximum(state.invincibility_timer - 1, 0),
-            added_duration
-        )
-
-        is_invincible = new_inv_timer > 0
+        hit_manager2 = jnp.any(consumable_collisions2 & (type_mask == 9))
+        hit_roadie2 = jnp.any(consumable_collisions2 & ((type_mask == 1) | (type_mask == 5)))
+        added_duration2 = jnp.where(hit_manager2, self.consts.INV_DURATION_MANAGER,
+                            jnp.where(hit_roadie2, self.consts.INV_DURATION_ROADIE, 0))
+        new_inv_timer2 = jnp.maximum(jnp.maximum(state.twin_invincibility_timer - 1, 0), added_duration2)
+        is_invincible2 = new_inv_timer2 > 0
 
         # Override Physics (The "Ghost" Effect)
-        # If invincible, we are effectively never stuck.
-        is_stuck_final = is_stuck & jnp.logical_not(is_invincible)
+        is_stuck_final1 = is_stuck1 & jnp.logical_not(is_invincible1)
+        is_stuck_final2 = is_stuck2 & jnp.logical_not(is_invincible2)
 
         # Scoring Logic
+        cooling_down1 = state.hit_cooldown > 0
+        solid_score_effect1 = jnp.min(jnp.where(solid_collisions1 | anchor_collisions1, self.consts.SCORE_PENALTIES[type_mask], 0)).astype(jnp.int32)
+        apply_damage1 = (solid_score_effect1 < 0) & jnp.logical_not(cooling_down1) & jnp.logical_not(is_invincible1)
+        consumable_score_effect1 = jnp.sum(jnp.where(consumable_collisions1, self.consts.SCORE_PENALTIES[type_mask], 0)).astype(jnp.int32)
+        damage_delta1 = jnp.where(apply_damage1, solid_score_effect1, 0)
+        
+        cooling_down2 = state.twin_hit_cooldown > 0
+        solid_score_effect2 = jnp.min(jnp.where(solid_collisions2 | anchor_collisions2, self.consts.SCORE_PENALTIES[type_mask], 0)).astype(jnp.int32)
+        apply_damage2 = (solid_score_effect2 < 0) & jnp.logical_not(cooling_down2) & jnp.logical_not(is_invincible2)
+        consumable_score_effect2 = jnp.sum(jnp.where(consumable_collisions2, self.consts.SCORE_PENALTIES[type_mask], 0)).astype(jnp.int32)
+        damage_delta2 = jnp.where(apply_damage2, solid_score_effect2, 0)
 
-        # - Solid/Damage
-        cooling_down = state.hit_cooldown > 0
-        solid_score_effect = jnp.min(
-            jnp.where(solid_collisions | anchor_collisions, self.consts.SCORE_PENALTIES[type_mask], 0)
-        ).astype(jnp.int32)
-
-        apply_damage = (solid_score_effect < 0) & jnp.logical_not(cooling_down) & jnp.logical_not(is_invincible)
-
-        # - Consumable/Reward
-        consumable_score_effect = jnp.sum(
-            jnp.where(consumable_collisions, self.consts.SCORE_PENALTIES[type_mask], 0)
-        ).astype(jnp.int32)
-
-        # Update Score
-        damage_delta = jnp.where(apply_damage, solid_score_effect, 0)
-        total_delta = damage_delta + consumable_score_effect
+        total_delta = damage_delta1 + consumable_score_effect1 + damage_delta2 + consumable_score_effect2
         new_score = jnp.maximum(state.score + total_delta, 0)
 
-        # Update Cooldown
-        new_hit_cooldown = jnp.where(
-            apply_damage,
-            self.consts.hit_cooldown_frames,
-            jnp.maximum(state.hit_cooldown - 1, 0)
-        )
+        new_hit_cooldown1 = jnp.where(apply_damage1, self.consts.hit_cooldown_frames, jnp.maximum(state.hit_cooldown - 1, 0))
+        new_hit_cooldown2 = jnp.where(apply_damage2, self.consts.hit_cooldown_frames, jnp.maximum(state.twin_hit_cooldown - 1, 0))
 
         # [Debugging]
-
-        jax.lax.cond(
-            apply_damage,
-            lambda _: jax.debug.print("Hit! Effect: {}, New Score: {}", total_delta, new_score),
-            lambda _: None,
-            operand=None
-        )
+        hit_manager = hit_manager1 | hit_manager2
+        hit_roadie = hit_roadie1 | hit_roadie2
+        apply_damage = apply_damage1 | apply_damage2
 
         # --- Movement Physics ("Sticky" Logic) ---
-
-        # Reduce left and right movement speed on collision
         move_tick = (state.time % 4 == 0).astype(jnp.int32)
         reduced_dx = dx_int * move_tick
-
         drag_speed = self.consts.obstacle_speed_px_per_frame
 
-        # Y-Axis
-        new_y_raw = jnp.where(
-            is_stuck_final,
-            state.player_y + drag_speed,  # Strict Drag
-            pre_y  # Normal Movement
-        ).astype(jnp.int32)
+        new_y1_raw = jnp.where(is_stuck_final1, state.player_y + drag_speed, pre_y).astype(jnp.int32)
+        new_y1 = jnp.clip(new_y1_raw, player_min_y, player_max_y)
 
-        # Clip to screen
-        new_y = jnp.clip(new_y_raw, player_min_y, player_max_y)
+        new_y2_raw = jnp.where(is_stuck_final2, state.twin_y + drag_speed, twin_pre_y).astype(jnp.int32)
+        new_y2 = jnp.clip(new_y2_raw, player_min_y, player_max_y)
 
         # X-Axis
-        # Determine Blocking
-        # We use the union of collision masks to ensure blocking works for both cases
-        combined_collisions = solid_collisions | anchor_collisions
+        combined_collisions1 = solid_collisions1 | anchor_collisions1
+        block_right1 = jnp.any(combined_collisions1 & (relative_x1 < 0))
+        block_left1 = jnp.any(combined_collisions1 & (relative_x1 > 0))
+        effective_dx1 = jnp.where(is_stuck_final1, reduced_dx, dx_int)
 
-        block_right = jnp.any(combined_collisions & (relative_x < 0))
-        block_left = jnp.any(combined_collisions & (relative_x > 0))
+        combined_collisions2 = solid_collisions2 | anchor_collisions2
+        block_right2 = jnp.any(combined_collisions2 & (relative_x2 < 0))
+        block_left2 = jnp.any(combined_collisions2 & (relative_x2 > 0))
+        effective_dx2 = jnp.where(is_stuck_final2, reduced_dx, dx_int)
 
-        # Determine Speed
-        effective_dx = jnp.where(is_stuck_final, reduced_dx, dx_int)
+        can_move_x_raw1 = jnp.logical_not((block_right1 & (effective_dx1 > 0)) | (block_left1 & (effective_dx1 < 0)))
+        can_move_x1 = can_move_x_raw1 | is_invincible1
+        final_dx1 = jnp.where(can_move_x1, effective_dx1, 0)
 
-        # Apply Blocking
-        can_move_x_raw = jnp.logical_not(
-            (block_right & (effective_dx > 0)) |
-            (block_left & (effective_dx < 0))
-        )
+        can_move_x_raw2 = jnp.logical_not((block_right2 & (effective_dx2 > 0)) | (block_left2 & (effective_dx2 < 0)))
+        can_move_x2 = can_move_x_raw2 | is_invincible2
+        final_dx2 = jnp.where(can_move_x2, effective_dx2, 0)
 
-        can_move_x = can_move_x_raw | is_invincible
-
-        final_dx = jnp.where(can_move_x, effective_dx, 0)
-
-        # Bottom Push Out Edge Case
-        at_bottom_edge = (state.player_y >= player_max_y - 1)
+        at_bottom_edge1 = (state.player_y >= player_max_y - 1)
+        at_bottom_edge2 = (state.twin_y >= player_max_y - 1)
 
         def check_static_overlap(box):
-            """
-            Checks overlap using the player's CURRENT position.
-
-            The main collision logic is predictive (uses the proposed position after input).
-            This check catches cases where an obstacle has already moved into the player,
-            so we don't incorrectly release drag or allow sideways escape.
-            """
             b_x, b_y, b_w, b_h, b_type, _b_dx, _b_mp, _b_cd = box
+            p1_x, p1_y = state.player_x, state.player_y
+            overlap_x1 = (p1_x < b_x + b_w) & (p1_x + self.consts.player_width > b_x)
+            overlap_y1 = (p1_y < b_y + b_h) & (p1_y + self.consts.player_height > b_y)
 
-            p_x, p_y = state.player_x, state.player_y
-            p_w, p_h = self.consts.player_width, self.consts.player_height
-
-            overlap_x = (p_x < b_x + b_w) & (p_x + p_w > b_x)
-            overlap_y = (p_y < b_y + b_h) & (p_y + p_h > b_y)
+            p2_x, p2_y = state.twin_x, state.twin_y
+            overlap_x2 = (p2_x < b_x + b_w) & (p2_x + self.consts.player_width > b_x)
+            overlap_y2 = (p2_y < b_y + b_h) & (p2_y + self.consts.player_height > b_y)
 
             is_active = b_h > 0
             is_solid = self.consts.IS_SOLID[b_type]
 
-            return is_active & is_solid & overlap_x & overlap_y
+            hit1 = is_active & is_solid & overlap_x1 & overlap_y1
+            hit2 = is_active & is_solid & overlap_x2 & overlap_y2
+            return hit1, hit2
 
-        # Compute static mask
-        static_collisions = jax.vmap(check_static_overlap)(boxes)
-        is_crushed = jnp.any(static_collisions)
+        static_collisions1, static_collisions2 = jax.vmap(check_static_overlap)(boxes)
+        static_collisions2 = static_collisions2 & self.consts.is_twin_mode
 
-        # Determine Push Direction with Bias (25% Left / 75% Right) (as it is in ALE)
+        is_crushed1 = jnp.any(static_collisions1)
+        is_crushed2 = jnp.any(static_collisions2)
 
-        # Get the width of the obstacle we are currently crushed by
-        # boxes[:, 2] is width. We sum the widths of colliding boxes (usually just 1).
-        crushed_width = jnp.sum(jnp.where(static_collisions, boxes[:, 2], 0))
+        crushed_width1 = jnp.sum(jnp.where(static_collisions1, boxes[:, 2], 0))
+        split_threshold1 = -(crushed_width1 // 4).astype(jnp.int32)
+        crushed_rel_x1 = jnp.sum(jnp.where(static_collisions1, relative_x1, 0))
+        push_dir1 = jnp.where(crushed_rel_x1 >= split_threshold1, 1, -1)
 
-        # Calculate the split threshold
-        # Normal center split is at 0.
-        # Since 0 is 50%, 25% corresponds to -Width/4 relative to center.
-        split_threshold = -(crushed_width // 4).astype(jnp.int32)
+        crushed_width2 = jnp.sum(jnp.where(static_collisions2, boxes[:, 2], 0))
+        split_threshold2 = -(crushed_width2 // 4).astype(jnp.int32)
+        crushed_rel_x2 = jnp.sum(jnp.where(static_collisions2, relative_x2, 0))
+        push_dir2 = jnp.where(crushed_rel_x2 >= split_threshold2, 1, -1)
 
-        # Get relative position
-        crushed_rel_x = jnp.sum(jnp.where(static_collisions, relative_x, 0))
+        should_eject1 = is_crushed1 & at_bottom_edge1
+        force_push_val1 = jnp.where(should_eject1, push_dir1, 0)
+        dx_applied1 = jnp.where(should_eject1, force_push_val1, final_dx1)
+        new_x1 = jnp.clip(state.player_x + dx_applied1, player_min_x, player_max_x).astype(jnp.int32)
 
-        # Determine Direction
-        # If we are to the right of the 25% mark -> Push Right (+1)
-        # Otherwise -> Push Left (-1)
-        push_dir = jnp.where(crushed_rel_x >= split_threshold, 1, -1)
-
-        # Trigger Force Push ONLY if we are physically inside AND at the bottom
-        should_eject = is_crushed & at_bottom_edge
-
-        force_push_val = jnp.where(should_eject, push_dir, 0)
-
-        # Apply: If ejecting, override normal movement input
-        dx_applied = jnp.where(should_eject, force_push_val, final_dx)
-
-        new_x = jnp.clip(state.player_x + dx_applied, player_min_x, player_max_x).astype(jnp.int32)
+        should_eject2 = is_crushed2 & at_bottom_edge2
+        force_push_val2 = jnp.where(should_eject2, push_dir2, 0)
+        dx_applied2 = jnp.where(should_eject2, force_push_val2, final_dx2)
+        new_x2 = jnp.clip(state.twin_x + dx_applied2, player_min_x, player_max_x).astype(jnp.int32)
 
         # Update time
         new_time = (state.time + 1).astype(jnp.int32)
@@ -873,7 +843,7 @@ class JaxJourneyEscape(
         # Print when we hit specific Powerups
         jax.lax.cond(
             hit_manager,
-            lambda _: jax.debug.print(">> HIT MIGHTY MANAGER! (Infinite Invincibility) Score: {}", consumable_score_effect),
+            lambda _: jax.debug.print(">> HIT MIGHTY MANAGER! (Infinite Invincibility) Score: {}", consumable_score_effect1 + consumable_score_effect2),
             lambda _: None,
             operand=None
         )
@@ -887,8 +857,8 @@ class JaxJourneyEscape(
 
         # Print Timer status periodically (e.g., every 60 frames) if active
         jax.lax.cond(
-            (new_inv_timer > 0) & (new_time % 60 == 0),
-            lambda _: jax.debug.print("... Invincibility Active. Timer: {}", new_inv_timer),
+            (new_inv_timer1 > 0) & (new_time % 60 == 0),
+            lambda _: jax.debug.print("... Invincibility Active 1. Timer: {}", new_inv_timer1),
             lambda _: None,
             operand=None
         )
@@ -905,8 +875,8 @@ class JaxJourneyEscape(
         )
 
         new_state = JourneyEscapeState(
-            player_y=new_y,
-            player_x=new_x,
+            player_y=new_y1,
+            player_x=new_x1,
             score=new_score,
             time=new_time,
             walking_frames=new_walking_frames.astype(jnp.int32),
@@ -915,12 +885,17 @@ class JaxJourneyEscape(
             row_timer=new_row_timer.astype(jnp.int32),
             obstacles=boxes.astype(jnp.int32),  # updated pool
             obstacle_frames=new_obstacle_frames.astype(jnp.int32),
-            invincibility_timer=new_inv_timer,
+            invincibility_timer=new_inv_timer1,
             spawn_count=new_spawn_count,
             rng_key=new_rng,
-            hit_cooldown=new_hit_cooldown.astype(jnp.int32),
+            hit_cooldown=new_hit_cooldown1.astype(jnp.int32),
             countdown=new_countdown.astype(jnp.int32),
-            bg_frames=new_bg_frames.astype(jnp.int32)
+            bg_frames=new_bg_frames.astype(jnp.int32),
+            twin_y=new_y2,
+            twin_x=new_x2,
+            twin_walking_direction=new_walking_direction.astype(jnp.int32),
+            twin_hit_cooldown=new_hit_cooldown2.astype(jnp.int32),
+            twin_invincibility_timer=new_inv_timer2.astype(jnp.int32),
         )
         done = self._get_done(new_state)
         env_reward = self._get_reward(state, new_state)
@@ -1222,6 +1197,16 @@ class JourneyEscapeRenderer(JAXGameRenderer):
 
         player_mask = self.SHAPE_MASKS["player"][player_frame_index]
         raster = self.jr.render_at(raster, state.player_x, state.player_y, player_mask)
+
+        # Select twin player sprite
+        twin_sprite_index = state.twin_walking_direction * 2
+        twin_frame_index = jax.lax.select(use_idle, twin_sprite_index, twin_sprite_index + 1)
+        twin_mask = self.SHAPE_MASKS["player"][twin_frame_index]
+        
+        def draw_twin(r):
+            return self.jr.render_at(r, state.twin_x, state.twin_y, twin_mask)
+            
+        raster = jax.lax.cond(self.consts.is_twin_mode, draw_twin, lambda r: r, raster)
 
         # Render Header (Top Blue)
         header_pos_y = self.consts.top_border - self.consts.top_blue_area_height

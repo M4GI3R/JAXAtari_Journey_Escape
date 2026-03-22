@@ -1,6 +1,6 @@
 import os
 from jaxatari.modification import JaxAtariModController
-from jaxatari.games.mods.journey_escape.journey_escape_mod_plugins import BackgroundStaticMod, SpeedUpPlayerMod, SpeedUpObstaclesMod, ReducePlayerSizeMod, RestrictPlayerMovementMod, ObstacleDiagonalMovementMod, ObstacleSteepDiagonalMovementMod, ObstacleAcceleratingBounceMod, ObstacleRandomDirectionSwitchMod, ObstacleChaoticMovementMod
+from jaxatari.games.mods.journey_escape.journey_escape_mod_plugins import BackgroundStaticMod, SpeedUpPlayerMod, SpeedUpObstaclesMod, ReducePlayerSizeMod, RestrictPlayerMovementMod, ObstacleDiagonalMovementMod, ObstacleSteepDiagonalMovementMod, ObstacleAcceleratingBounceMod, ObstacleRandomDirectionSwitchMod, ObstacleChaoticMovementMod, TwinMod
 
 
 class JourneyEscapeEnvMod(JaxAtariModController):
@@ -20,7 +20,8 @@ class JourneyEscapeEnvMod(JaxAtariModController):
         "obstacle_steep_diagonal_movement": ObstacleSteepDiagonalMovementMod,
         "obstacle_accelerating_bounce": ObstacleAcceleratingBounceMod,
         "obstacle_random_direction": ObstacleRandomDirectionSwitchMod,
-        "obstacle_chaotic_movement": ObstacleChaoticMovementMod
+        "obstacle_chaotic_movement": ObstacleChaoticMovementMod,
+        "twin": TwinMod
     }
 
     _mod_sprite_dir = os.path.join(os.path.dirname(__file__), "journey_escape", "sprites")

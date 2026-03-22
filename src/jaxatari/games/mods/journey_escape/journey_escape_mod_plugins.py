@@ -224,3 +224,13 @@ class ObstacleChaoticMovementMod(JaxAtariInternalModPlugin):
             0.95,  # 15: big manager (1)
         ),
     }
+
+class TwinMod(JaxAtariInternalModPlugin):
+    """
+    Spawns a second player. Both are controlled simultaneously but act
+    independently in physical space. Starting money is doubled.
+    """
+    constants_overrides = {
+        "is_twin_mode": True,
+        "starting_score": 100000,
+    }
